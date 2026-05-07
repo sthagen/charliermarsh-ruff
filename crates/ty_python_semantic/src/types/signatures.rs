@@ -1073,6 +1073,33 @@ impl<'db> Signature<'db> {
         }
     }
 
+    pub(crate) fn is_non_generic(&self) -> bool {
+        self.generic_context.is_none()
+    }
+
+    /// Return whether this non-generic implementation accepts the arguments of a non-generic
+    /// overload.
+    ///
+    /// This is a deliberately narrow first pass for overload implementation consistency. Generic
+    /// signatures need additional type-variable-domain handling and should be left to the full
+    /// implementation.
+    pub(crate) fn are_non_generic_implementation_parameters_consistent_with(
+        &self,
+        db: &'db dyn Db,
+        overload: &Self,
+    ) -> bool {
+        debug_assert!(self.is_non_generic());
+        debug_assert!(overload.is_non_generic());
+
+        let implementation = self.clone().with_return_type(Type::unknown());
+        let overload = overload.clone().with_return_type(Type::unknown());
+        let constraints = ConstraintSetBuilder::new();
+
+        implementation
+            .when_constraint_set_assignable_to(db, &overload, &constraints)
+            .is_always_satisfied(db)
+    }
+
     pub(crate) fn when_constraint_set_assignable_to_signatures<'c>(
         &self,
         db: &'db dyn Db,
