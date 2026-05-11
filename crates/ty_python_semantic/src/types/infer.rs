@@ -83,6 +83,60 @@ bitflags::bitflags! {
 
 impl get_size2::GetSize for TypeExpressionFlags {}
 
+/// Compact immutable key-value entries stored in key order.
+///
+/// This keeps the mutable construction path on [`FxHashMap`], then switches to a denser retained
+/// representation for cached inference results that only need iteration and keyed lookup.
+#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+pub(super) struct FrozenMap<K, V>(Box<[(K, V)]>);
+
+impl<K, V> FrozenMap<K, V> {
+    pub(super) fn iter(&self) -> std::slice::Iter<'_, (K, V)> {
+        self.0.iter()
+    }
+}
+
+impl<K: Ord, V> From<FxHashMap<K, V>> for FrozenMap<K, V> {
+    fn from(map: FxHashMap<K, V>) -> Self {
+        let mut entries = map.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        Self(entries.into_boxed_slice())
+    }
+}
+
+impl<K: Ord, V> FrozenMap<K, V> {
+    pub(super) fn get(&self, key: &K) -> Option<&V> {
+        self.0
+            .binary_search_by(|(candidate, _)| candidate.cmp(key))
+            .ok()
+            .map(|index| &self.0[index].1)
+    }
+}
+
+impl<K, V> Default for FrozenMap<K, V> {
+    fn default() -> Self {
+        Self(Box::default())
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a FrozenMap<K, V> {
+    type Item = &'a (K, V);
+    type IntoIter = std::slice::Iter<'a, (K, V)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a mut FrozenMap<K, V> {
+    type Item = &'a mut (K, V);
+    type IntoIter = std::slice::IterMut<'a, (K, V)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
 /// Infer all types for a [`Definition`] (including sub-expressions).
 /// Use when resolving a place use or public type of a place.
 #[salsa::tracked(
@@ -158,7 +212,7 @@ pub(crate) fn function_known_decorator_flags<'db>(
 /// function-definition inference.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FunctionDecoratorInference<'db> {
-    expression_types: FxHashMap<ExpressionNodeKey, Type<'db>>,
+    expression_types: FrozenMap<ExpressionNodeKey, Type<'db>>,
     bindings: Box<[(Definition<'db>, Type<'db>)]>,
     called_functions: Box<[FunctionType<'db>]>,
     known_decorators: FunctionDecorators,
@@ -173,8 +227,10 @@ impl<'db> FunctionDecoratorInference<'db> {
         self.expression_types.get(&expression.into()).copied()
     }
 
-    pub(crate) fn expression_types(&self) -> &FxHashMap<ExpressionNodeKey, Type<'db>> {
-        &self.expression_types
+    pub(crate) fn expression_types(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (ExpressionNodeKey, Type<'db>)> + '_ {
+        self.expression_types.iter().copied()
     }
 
     pub(crate) fn bindings(
@@ -688,7 +744,7 @@ impl<'db> InferenceRegion<'db> {
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct ScopeInference<'db> {
     /// The types of every expression in this region.
-    expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
+    expressions: FrozenMap<ExpressionNodeKey, Type<'db>>,
 
     /// The extra data that is only present for few inference regions.
     extra: Option<Box<ScopeInferenceExtra<'db>>>,
@@ -718,7 +774,7 @@ impl<'db> ScopeInference<'db> {
                 cycle_recovery: Some(cycle_recovery),
                 ..ScopeInferenceExtra::default()
             })),
-            expressions: FxHashMap::default(),
+            expressions: FrozenMap::default(),
         }
     }
 
@@ -794,7 +850,7 @@ impl<'db> ScopeInference<'db> {
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct DefinitionInference<'db> {
     /// The types of every expression in this region.
-    expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
+    expressions: FrozenMap<ExpressionNodeKey, Type<'db>>,
 
     /// The scope this region is part of.
     #[cfg(debug_assertions)]
@@ -852,7 +908,7 @@ impl<'db> DefinitionInference<'db> {
         let _ = scope;
 
         Self {
-            expressions: FxHashMap::default(),
+            expressions: FrozenMap::default(),
             bindings: Box::default(),
             declarations: Box::default(),
             #[cfg(debug_assertions)]
@@ -1004,7 +1060,7 @@ impl<'db> DefinitionInference<'db> {
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct ExpressionInference<'db> {
     /// The types of every expression in this region.
-    expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
+    expressions: FrozenMap<ExpressionNodeKey, Type<'db>>,
 
     extra: Option<Box<ExpressionInferenceExtra<'db>>>,
 
@@ -1044,7 +1100,7 @@ impl<'db> ExpressionInference<'db> {
                 cycle_recovery: Some(cycle_recovery),
                 ..ExpressionInferenceExtra::default()
             })),
-            expressions: FxHashMap::default(),
+            expressions: FrozenMap::default(),
             #[cfg(debug_assertions)]
             scope,
         }
@@ -1124,7 +1180,7 @@ impl<'db> StatementInference<'db> {
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct StatementInferenceInner<'db> {
     /// The types of every expression in this region.
-    expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
+    expressions: FrozenMap<ExpressionNodeKey, Type<'db>>,
 
     /// The scope this region is part of.
     #[cfg(debug_assertions)]
@@ -1173,7 +1229,7 @@ impl<'db> StatementInferenceInner<'db> {
         let _ = scope;
 
         Self {
-            expressions: FxHashMap::default(),
+            expressions: FrozenMap::default(),
             bindings: Box::default(),
             declarations: Box::default(),
             #[cfg(debug_assertions)]
