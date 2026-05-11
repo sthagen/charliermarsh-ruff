@@ -2756,6 +2756,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     infer_value_ty(self, TypeContext::default());
                     return true;
                 };
+                let Some(class_attr_self_ty) = object_ty.to_instance(db) else {
+                    infer_value_ty(self, TypeContext::default());
+                    return true;
+                };
 
                 match meta_attr {
                     PlaceAndQualifiers {
@@ -2840,6 +2844,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 ..
                             } = fallback_attr
                             {
+                                let class_attr_ty =
+                                    class_attr_ty.bind_self_typevars(db, class_attr_self_ty);
                                 let value_ty = infer_value_ty
                                     .infer_silent(self, TypeContext::new(Some(class_attr_ty)));
                                 (
@@ -2880,6 +2886,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             qualifiers,
                         }) = fallback_attr
                         {
+                            let class_attr_ty =
+                                class_attr_ty.bind_self_typevars(db, class_attr_self_ty);
                             let value_ty =
                                 infer_value_ty(self, TypeContext::new(Some(class_attr_ty)));
                             if emit_diagnostics
