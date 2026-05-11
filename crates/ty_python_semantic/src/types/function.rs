@@ -79,7 +79,7 @@ use crate::types::known_instance::DeprecatedInstance;
 use crate::types::list_members::all_members;
 use crate::types::narrow::ClassInfoConstraintFunction;
 use crate::types::relation::TypeRelationChecker;
-use crate::types::signatures::{CallableSignature, Signature};
+use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope, Signature};
 use crate::types::visitor::any_over_type;
 use crate::types::{
     ApplyTypeMappingVisitor, BoundMethodType, BoundTypeVarInstance, CallableType, ClassBase,
@@ -420,7 +420,7 @@ impl<'db> OverloadLiteral<'db> {
     /// a cross-module dependency directly on the full AST which will lead to cache
     /// over-invalidation.
     pub(crate) fn signature(self, db: &'db dyn Db) -> Signature<'db> {
-        let mut signature = self.raw_signature(db);
+        let mut signature = self.raw_signature(db, ReturnCallableTypeVarScope::Public);
 
         let scope = self.body_scope(db);
         let module = parsed_module(db, self.file(db)).load(db);
@@ -438,6 +438,8 @@ impl<'db> OverloadLiteral<'db> {
 
     /// Typed internally-visible "raw" signature for this function.
     /// That is, the return types of async functions are not wrapped in `CoroutineType[...]`.
+    /// The `return_callable_typevar_scope` controls whether type variables that only appear in a
+    /// return-position `Callable` stay bound to the function or move to the returned callable.
     ///
     /// ## Warning
     ///
@@ -445,7 +447,11 @@ impl<'db> OverloadLiteral<'db> {
     /// calling query is not in the same file as this function is defined in, then this will create
     /// a cross-module dependency directly on the full AST which will lead to cache
     /// over-invalidation.
-    pub(super) fn raw_signature(self, db: &'db dyn Db) -> Signature<'db> {
+    pub(super) fn raw_signature(
+        self,
+        db: &'db dyn Db,
+        return_callable_typevar_scope: ReturnCallableTypeVarScope,
+    ) -> Signature<'db> {
         /// `self` or `cls` can be implicitly positional-only if:
         /// - It is a method AND
         /// - No parameters in the method use PEP-570 syntax AND
@@ -526,6 +532,7 @@ impl<'db> OverloadLiteral<'db> {
             definition,
             function_stmt_node,
             has_implicitly_positional_first_parameter,
+            return_callable_typevar_scope,
         );
 
         let generic_context = raw_signature.generic_context;
@@ -781,6 +788,8 @@ impl<'db> FunctionLiteral<'db> {
     }
 
     /// Typed externally-visible "raw" signature of the last overload or implementation of this function.
+    /// The `return_callable_typevar_scope` controls whether type variables that only appear in a
+    /// return-position `Callable` stay bound to the function or move to the returned callable.
     ///
     /// ## Warning
     ///
@@ -788,8 +797,13 @@ impl<'db> FunctionLiteral<'db> {
     /// calling query is not in the same file as this function is defined in, then this will create
     /// a cross-module dependency directly on the full AST which will lead to cache
     /// over-invalidation.
-    fn last_definition_raw_signature(self, db: &'db dyn Db) -> Signature<'db> {
-        self.last_definition.raw_signature(db)
+    fn last_definition_raw_signature(
+        self,
+        db: &'db dyn Db,
+        return_callable_typevar_scope: ReturnCallableTypeVarScope,
+    ) -> Signature<'db> {
+        self.last_definition
+            .raw_signature(db, return_callable_typevar_scope)
     }
 
     /// Return `Some()` if this function is an abstract method.
@@ -1183,12 +1197,19 @@ impl<'db> FunctionType<'db> {
     }
 
     /// Typed externally-visible "raw" signature of the last overload or implementation of this function.
+    /// The `return_callable_typevar_scope` controls whether type variables that only appear in a
+    /// return-position `Callable` stay bound to the function or move to the returned callable.
     #[salsa::tracked(
-        returns(ref), cycle_initial=last_definition_signature_cycle_initial,
+        returns(ref), cycle_initial=last_definition_raw_signature_cycle_initial,
         heap_size=ruff_memory_usage::heap_size,
     )]
-    pub(crate) fn last_definition_raw_signature(self, db: &'db dyn Db) -> Signature<'db> {
-        self.literal(db).last_definition_raw_signature(db)
+    pub(crate) fn last_definition_raw_signature(
+        self,
+        db: &'db dyn Db,
+        return_callable_typevar_scope: ReturnCallableTypeVarScope,
+    ) -> Signature<'db> {
+        self.literal(db)
+            .last_definition_raw_signature(db, return_callable_typevar_scope)
     }
 
     /// Convert the `FunctionType` into a [`CallableType`].
@@ -1595,6 +1616,15 @@ fn last_definition_signature_cycle_initial<'db>(
     _db: &'db dyn Db,
     _id: salsa::Id,
     _function: FunctionType<'db>,
+) -> Signature<'db> {
+    Signature::bottom()
+}
+
+fn last_definition_raw_signature_cycle_initial<'db>(
+    _db: &'db dyn Db,
+    _id: salsa::Id,
+    _function: FunctionType<'db>,
+    _return_callable_typevar_scope: ReturnCallableTypeVarScope,
 ) -> Signature<'db> {
     Signature::bottom()
 }
