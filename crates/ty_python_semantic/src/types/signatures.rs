@@ -146,6 +146,24 @@ impl<'db> CallableSignature<'db> {
         Self::single(Signature::bottom())
     }
 
+    pub(crate) fn cycle_initial(db: &'db dyn Db, id: salsa::Id) -> Self {
+        Self::single(Signature::new(
+            Parameters::bottom(),
+            Type::divergent(id).bottom_materialization(db),
+        ))
+    }
+
+    fn is_cycle_initial(&self) -> bool {
+        matches!(
+            self.overloads.as_slice(),
+            [signature]
+                if signature.generic_context.is_none()
+                    && signature.definition.is_none()
+                    && signature.parameters == Parameters::bottom()
+                    && signature.return_ty.is_divergent()
+        )
+    }
+
     /// Creates a new `CallableSignature` from an iterator of [`Signature`]s. Returns a
     /// non-callable signature if the iterator is empty.
     pub(crate) fn from_overloads<I>(overloads: I) -> Self
@@ -222,7 +240,7 @@ impl<'db> CallableSignature<'db> {
                     .collect(),
             }
         } else {
-            debug_assert_eq!(previous, &Self::bottom());
+            debug_assert!(previous.is_cycle_initial());
             self.clone()
         }
     }

@@ -57,6 +57,7 @@ use ruff_db::files::{File, FileRange};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::{self as ast, ParameterWithDefault};
 use ruff_text_size::Ranged;
+use salsa::plumbing::AsId;
 use ty_module_resolver::{KnownModule, ModuleName, file_to_module, resolve_module};
 
 use crate::place::{DefinedPlace, Definedness, Place, place_from_bindings};
@@ -64,6 +65,7 @@ use crate::types::call::{Binding, CallArguments};
 use crate::types::callable::CallableTypeKind;
 use crate::types::constraints::ConstraintSet;
 use crate::types::context::InferContext;
+use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::diagnostic::{
     ASSERT_TYPE_UNSPELLABLE_SUBTYPE, INVALID_ARGUMENT_TYPE, REDUNDANT_CAST, STATIC_ASSERT_ERROR,
     TYPE_ASSERTION_FAILURE, report_bad_argument_to_get_protocol_members,
@@ -73,13 +75,14 @@ use crate::types::diagnostic::{
     report_runtime_check_against_typed_dict,
 };
 use crate::types::display::DisplaySettings;
-use crate::types::generics::{GenericContext, typing_self};
+use crate::types::generics::{ApplySpecialization, GenericContext, typing_self};
 use crate::types::infer::nearest_enclosing_class;
 use crate::types::known_instance::DeprecatedInstance;
 use crate::types::list_members::all_members;
 use crate::types::narrow::ClassInfoConstraintFunction;
 use crate::types::relation::TypeRelationChecker;
 use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope, Signature};
+use crate::types::variance::{TypeVarVariance, VarianceInferable};
 use crate::types::visitor::any_over_type;
 use crate::types::{
     ApplyTypeMappingVisitor, BoundMethodType, BoundTypeVarInstance, CallableType, ClassBase,
@@ -93,6 +96,45 @@ use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::Definition;
 use ty_python_core::scope::ScopeId;
 use ty_python_core::{FileScopeId, SemanticIndex, semantic_index};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RecursiveTypeNormalizationKey {
+    function_literal: salsa::Id,
+    nested: bool,
+}
+
+// Keep this detector thread-local rather than threading it through every recursive
+// normalization helper. Passing an explicit visitor would model the recursion state more
+// directly, but it would touch a wide slice of the type-normalization plumbing for no current
+// behavioral benefit. This works because recursive normalization currently stays on a single
+// thread/query stack; if that ever changes, revisit this and prefer explicit visitor propagation.
+std::thread_local! {
+    static ACTIVE_RECURSIVE_TYPE_NORMALIZATIONS: ActiveRecursionDetector<RecursiveTypeNormalizationKey> =
+        ActiveRecursionDetector::default();
+}
+
+/// Runs recursive type normalization under a scoped guard keyed by function literal identity.
+///
+/// `TypeOf` can make a function signature refer back to the same function through many different
+/// type components. Keeping this guard scoped here lets those components keep their ordinary
+/// `recursive_type_normalized_impl(db, div, nested)` signatures.
+fn visit_recursive_type_normalization<R>(
+    function_literal: FunctionLiteral<'_>,
+    nested: bool,
+    on_cycle: impl FnOnce() -> R,
+    func: impl FnOnce() -> R,
+) -> R {
+    ACTIVE_RECURSIVE_TYPE_NORMALIZATIONS.with(|detector| {
+        detector.visit(
+            &RecursiveTypeNormalizationKey {
+                function_literal: function_literal.last_definition.as_id(),
+                nested,
+            },
+            on_cycle,
+            func,
+        )
+    })
+}
 
 /// A collection of useful spans for annotating functions.
 ///
@@ -970,18 +1012,51 @@ impl<'db> FunctionType<'db> {
         tcx: TypeContext<'db>,
         visitor: &ApplyTypeMappingVisitor<'db>,
     ) -> Self {
-        let updated_signature =
-            self.signature(db)
-                .apply_type_mapping_impl(db, type_mapping, tcx, visitor);
-        let updated_last_definition_signature = self
-            .last_definition_signature(db)
-            .apply_type_mapping_impl(db, type_mapping, tcx, visitor);
-        Self::new(
-            db,
-            self.literal(db),
-            Some(updated_signature),
-            Some(updated_last_definition_signature),
-        )
+        // Returned-callable rescoping and type-alias specialization should not rebuild signatures from the
+        // function literal; doing so can re-enter recursive `TypeOf` evaluation.
+        let (updated_signature, updated_last_definition_signature) = if matches!(
+            type_mapping,
+            TypeMapping::ApplySpecialization(
+                ApplySpecialization::ReturnCallables(_) | ApplySpecialization::TypeAlias(_)
+            ) | TypeMapping::ApplySpecializationWithMaterialization {
+                specialization: ApplySpecialization::ReturnCallables(_)
+                    | ApplySpecialization::TypeAlias(_),
+                ..
+            }
+        ) {
+            (
+                self.updated_signature(db).map(|signature| {
+                    signature.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
+                }),
+                self.updated_last_definition_signature(db).map(|signature| {
+                    signature.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
+                }),
+            )
+        } else {
+            (
+                Some(
+                    self.signature(db)
+                        .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
+                ),
+                Some(self.last_definition_signature(db).apply_type_mapping_impl(
+                    db,
+                    type_mapping,
+                    tcx,
+                    visitor,
+                )),
+            )
+        };
+
+        if updated_signature.is_none() && updated_last_definition_signature.is_none() {
+            self
+        } else {
+            Self::new(
+                db,
+                self.literal(db),
+                updated_signature,
+                updated_last_definition_signature,
+            )
+        }
     }
 
     pub(crate) fn with_dataclass_transformer_params(
@@ -1076,6 +1151,13 @@ impl<'db> FunctionType<'db> {
         self.literal(db).definition(db)
     }
 
+    /// Returns `true` if this function includes `definition` as one of its overload signatures or
+    /// implementation.
+    pub(crate) fn contains_definition(self, db: &'db dyn Db, definition: Definition<'db>) -> bool {
+        self.iter_overloads_and_implementation(db)
+            .any(|overload| overload.definition(db) == definition)
+    }
+
     /// Returns a tuple of two spans. The first is
     /// the span for the identifier of the function
     /// definition for `self`. The second is
@@ -1167,7 +1249,7 @@ impl<'db> FunctionType<'db> {
     /// would depend on the function's AST and rerun for every change in that file.
     #[salsa::tracked(
         returns(ref),
-        cycle_initial=|_, _, _| CallableSignature::single(Signature::bottom()),
+        cycle_initial=|db, id, _| CallableSignature::cycle_initial(db, id),
         cycle_fn=|db, cycle, previous, value: CallableSignature<'db>, _| value.cycle_normalized(db, previous, cycle),
         heap_size=ruff_memory_usage::heap_size,
     )]
@@ -1175,6 +1257,22 @@ impl<'db> FunctionType<'db> {
         self.updated_signature(db)
             .cloned()
             .unwrap_or_else(|| self.literal(db).signature(db))
+    }
+
+    /// Infer the variance of a type variable within this function's signature.
+    ///
+    /// This is tracked because signatures can contain recursive `TypeOf` references back to the
+    /// function itself. Class and generic-alias variance use the same `Bivariant` cycle fallback.
+    #[salsa::tracked(
+        cycle_initial=|_, _, _, _| TypeVarVariance::Bivariant,
+        heap_size=ruff_memory_usage::heap_size,
+    )]
+    pub(crate) fn variance_of(
+        self,
+        db: &'db dyn Db,
+        typevar: BoundTypeVarInstance<'db>,
+    ) -> TypeVarVariance {
+        self.signature(db).variance_of(db, typevar)
     }
 
     /// Typed externally-visible signature of the last overload or implementation of this function.
@@ -1252,21 +1350,33 @@ impl<'db> FunctionType<'db> {
         div: Type<'db>,
         nested: bool,
     ) -> Option<Self> {
-        let literal = self.literal(db);
-        let updated_signature = match self.updated_signature(db) {
-            Some(signature) => Some(signature.recursive_type_normalized_impl(db, div, nested)?),
-            None => None,
-        };
-        let updated_last_definition_signature = match self.updated_last_definition_signature(db) {
-            Some(signature) => Some(signature.recursive_type_normalized_impl(db, div, nested)?),
-            None => None,
-        };
-        Some(Self::new(
-            db,
-            literal,
-            updated_signature,
-            updated_last_definition_signature,
-        ))
+        visit_recursive_type_normalization(
+            self.literal(db),
+            nested,
+            || None,
+            || {
+                let literal = self.literal(db);
+                let updated_signature = match self.updated_signature(db) {
+                    Some(signature) => {
+                        Some(signature.recursive_type_normalized_impl(db, div, nested)?)
+                    }
+                    None => None,
+                };
+                let updated_last_definition_signature =
+                    match self.updated_last_definition_signature(db) {
+                        Some(signature) => {
+                            Some(signature.recursive_type_normalized_impl(db, div, nested)?)
+                        }
+                        None => None,
+                    };
+                Some(Self::new(
+                    db,
+                    literal,
+                    updated_signature,
+                    updated_last_definition_signature,
+                ))
+            },
+        )
     }
 
     pub(super) fn as_abstract_method(

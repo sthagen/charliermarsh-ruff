@@ -5829,7 +5829,13 @@ impl<'db> Type<'db> {
                     // Without this special handling, recursive type aliases would result in cycles, returning an unspecialized fallback type.
                     TypeMapping::ApplySpecialization(specialization)
                     | TypeMapping::ApplySpecializationWithMaterialization { specialization, .. }
-                    if matches!(specialization, ApplySpecialization::Specialization(_) | ApplySpecialization::Partial { .. }) => {
+                    if matches!(
+                        specialization,
+                        ApplySpecialization::Specialization(_)
+                            | ApplySpecialization::TypeAlias(_)
+                            | ApplySpecialization::Partial { .. }
+                    ) =>
+                    {
                         let mut current_specialization = specialization.as_specialization(db).unwrap();
                         if let TypeMapping::ApplySpecializationWithMaterialization {
                             materialization_kind,
@@ -5995,7 +6001,7 @@ impl<'db> Type<'db> {
                 });
             }
 
-            Type::BoundMethod(method) => {
+            Type::BoundMethod(method) => visitor.visit(self, || {
                 method.self_instance(db).find_legacy_typevars_impl(
                     db,
                     binding_context,
@@ -6008,30 +6014,30 @@ impl<'db> Type<'db> {
                     typevars,
                     visitor,
                 );
-            }
+            }),
 
             Type::KnownBoundMethod(
                 KnownBoundMethodType::FunctionTypeDunderGet(function)
                 | KnownBoundMethodType::FunctionTypeDunderCall(function),
-            ) => {
+            ) => visitor.visit(self, || {
                 function.find_legacy_typevars_impl(db, binding_context, typevars, visitor);
-            }
+            }),
 
             Type::KnownBoundMethod(
                 KnownBoundMethodType::PropertyDunderGet(property)
                 | KnownBoundMethodType::PropertyDunderSet(property)
                 | KnownBoundMethodType::PropertyDunderDelete(property),
-            ) => {
+            ) => visitor.visit(self, || {
                 property.find_legacy_typevars_impl(db, binding_context, typevars, visitor);
-            }
+            }),
 
             Type::Callable(callable) => {
                 callable.find_legacy_typevars_impl(db, binding_context, typevars, visitor);
             }
 
-            Type::PropertyInstance(property) => {
+            Type::PropertyInstance(property) => visitor.visit(self, || {
                 property.find_legacy_typevars_impl(db, binding_context, typevars, visitor);
-            }
+            }),
 
             Type::Union(union) => {
                 for element in union.elements(db) {
@@ -6610,15 +6616,12 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
 
             Type::FunctionLiteral(function_type) => {
                 // TODO: do we need to replace self?
-                function_type.signature(db).variance_of(db, typevar)
+                function_type.variance_of(db, typevar)
             }
 
             Type::BoundMethod(method_type) => {
                 // TODO: do we need to replace self?
-                method_type
-                    .function(db)
-                    .signature(db)
-                    .variance_of(db, typevar)
+                method_type.function(db).variance_of(db, typevar)
             }
 
             Type::NominalInstance(nominal_instance_type) => {
