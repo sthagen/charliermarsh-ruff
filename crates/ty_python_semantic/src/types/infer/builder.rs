@@ -94,11 +94,11 @@ use crate::types::{
     BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType, CallableTypes, ClassType,
     DynamicType, InferenceFlags, InternedConstraintSet, InternedType, IntersectionBuilder,
     IntersectionType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueTypeKind,
-    MemberLookupPolicy, ParamSpecAttrKind, Parameter, ParameterForm, Parameters, Signature,
-    SpecialFormType, SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext,
-    TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypedDictType,
-    UnionAccumulator, UnionBuilder, UnionType, binding_type, infer_complete_scope_types,
-    infer_scope_types, todo_type,
+    MemberLookupPolicy, ParamSpecAttrKind, Parameter, ParameterForm, Parameters, SentinelInstance,
+    Signature, SpecialFormType, SubclassOfType, Type, TypeAliasType, TypeAndQualifiers,
+    TypeContext, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance,
+    TypedDictType, UnionAccumulator, UnionBuilder, UnionType, binding_type,
+    infer_complete_scope_types, infer_scope_types, todo_type,
 };
 use crate::{AnalysisSettings, Db, FxIndexSet, Program};
 use ty_python_core::ast_ids::ScopedUseId;
@@ -3462,6 +3462,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             Some(KnownClass::TypeAliasType) => {
                                 self.infer_typealiastype_call(target, call_expr, definition)
                             }
+                            Some(KnownClass::Sentinel) => self
+                                .infer_sentinel_expression(target, call_expr, definition)
+                                .unwrap_or_else(|| {
+                                    self.infer_call_expression_impl(call_expr, callable_type, tcx)
+                                }),
                             Some(_) | None => {
                                 self.infer_call_expression_impl(call_expr, callable_type, tcx)
                             }
@@ -3592,6 +3597,94 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             definition,
             None,
         )))
+    }
+
+    fn infer_sentinel_expression(
+        &mut self,
+        target: &ast::Expr,
+        call_expr: &ast::ExprCall,
+        definition: Definition<'db>,
+    ) -> Option<Type<'db>> {
+        if !self.sentinel_definition_scope_is_supported() {
+            return None;
+        }
+
+        let ast::Expr::Name(ast::ExprName {
+            id: target_name, ..
+        }) = target
+        else {
+            return None;
+        };
+
+        let ast::Arguments {
+            args,
+            keywords,
+            range: _,
+            node_index: _,
+        } = &call_expr.arguments;
+
+        if args.iter().any(ast::Expr::is_starred_expr) {
+            return None;
+        }
+
+        let (name_arg, mut repr_arg) = match &**args {
+            [name_arg] => (name_arg, None),
+            [name_arg, repr_arg] => (name_arg, Some(repr_arg)),
+            _ => return None,
+        };
+
+        for keyword in keywords {
+            let Some(keyword_name) = &keyword.arg else {
+                return None;
+            };
+
+            if keyword_name.as_str() != "repr" || repr_arg.is_some() {
+                return None;
+            }
+
+            repr_arg = Some(&keyword.value);
+        }
+
+        if !matches!(name_arg, ast::Expr::StringLiteral(_)) {
+            return None;
+        }
+
+        let Some(repr_arg) = repr_arg else {
+            return Some(Type::KnownInstance(KnownInstanceType::Sentinel(
+                SentinelInstance::new(self.db(), target_name.clone(), definition),
+            )));
+        };
+
+        if !matches!(repr_arg, ast::Expr::StringLiteral(_)) && !repr_arg.is_none_literal_expr() {
+            return None;
+        }
+
+        Some(Type::KnownInstance(KnownInstanceType::Sentinel(
+            SentinelInstance::new(self.db(), target_name.clone(), definition),
+        )))
+    }
+
+    fn sentinel_definition_scope_is_supported(&self) -> bool {
+        let db = self.db();
+        let mut scope_id = self.scope.file_scope_id(db);
+
+        loop {
+            let scope = self.index.scope(scope_id);
+            match scope.node().scope_kind() {
+                ScopeKind::Module => return true,
+                ScopeKind::Class => {}
+                ScopeKind::Function
+                | ScopeKind::Lambda
+                | ScopeKind::Comprehension
+                | ScopeKind::TypeAlias
+                | ScopeKind::TypeParams => return false,
+            }
+
+            let Some(parent) = scope.parent() else {
+                return false;
+            };
+            scope_id = parent;
+        }
     }
 
     fn infer_assignment_deferred(&mut self, target: &ast::Expr, value: &'ast ast::Expr) {
